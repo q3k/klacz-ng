@@ -10,7 +10,7 @@ def dispatch(request_type, data, channel):
 
         response = {}
         response["msgType"] = "data"
-        response["payload"] = config
+        response["payload"] = json.loads(config)
 
         channel.basic_publish(exchange='',
                               routing_key='klacz.info',

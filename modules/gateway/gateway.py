@@ -1,106 +1,127 @@
 from twisted.words.protocols import irc
 from twisted.internet import reactor, protocol
 from twisted.python import log
+from threading import Thread
+import time, sys, pika, json, atexit
 
-import time, sys
+class Settings():
+    def __init__(self):
+        self.connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
+        self.channel = self.connection.channel()
+        self.channel.queue_declare(queue='klacz.info')
+        self.channel.basic_consume(self.callback, queue='klacz.info', no_ack=True)
+        self.response = None
 
-class Gateway(irc.IRCClient):
+    def callback(self, ch, method, props, body):
+        self.response = body
+
+    def getConfig(self):
+        self.channel.basic_publish(exchange='',
+                                   routing_key='klacz.info',
+                                   body=json.dumps({"msgType" : "get-settings"})
+        )
+
+        while(self.response == None):
+            self.connection.process_data_events()
+
+        return json.loads(self.response)
+
+
+class LogBot(irc.IRCClient):
+    def module_message(self, ch, method, props, body):
+        print "[x] got response"
+        print body
+        j = json.loads(body)
+        self.msg(j["to"].encode('ascii'), j["message"].encode('utf-8'))
+
     def connectionMade(self):
         irc.IRCClient.connectionMade(self)
-        self.logger = MessageLogger(open(self.factory.filename, "a"))
-        self.logger.log("[connected at %s]" % 
-                        time.asctime(time.localtime(time.time())))
 
     def connectionLost(self, reason):
         irc.IRCClient.connectionLost(self, reason)
-        self.logger.log("[disconnected at %s]" % 
-                        time.asctime(time.localtime(time.time())))
-        self.logger.close()
-
-
-    # callbacks for events
 
     def signedOn(self):
-        """Called when bot has succesfully signed on to server."""
-        self.join(self.factory.channel)
+        for channel in self.factory.settings["channel"]:
+            self.join(channel.encode('ascii'))
 
     def joined(self, channel):
-        """This will get called when the bot joins the channel."""
-        self.logger.log("[I have joined %s]" % channel)
+        pass
 
     def privmsg(self, user, channel, msg):
-        """This will get called when the bot receives a message."""
         user = user.split('!', 1)[0]
-        self.logger.log("<%s> %s" % (user, msg))
-        # Check to see if they're sending me a private message
-        if channel == self.nickname:
-            msg = "It isn't nice to whisper!  Play nice with the group."
-            self.msg(user, msg)
-            return
+        payload = {
+            "from" : user if self.nickname == channel else channel,
+            "body" : msg
+        }
 
-        # Otherwise check to see if it is a message directed at me
-        if msg.startswith(self.nickname + ":"):
-            msg = "%s: I am a log bot" % user
-            self.msg(channel, msg)
-            self.logger.log("<%s> %s" % (self.nickname, msg))
+        message = {
+            "msgType" : "privmsg",
+            "payload" : payload
+        }
+
+        print message
+
+        self.factory.exchange.basic_publish(exchange='klacz.events',
+                                    routing_key='',
+                                    body=json.dumps(message))
 
     def action(self, user, channel, msg):
-        """This will get called when the bot sees someone do an action."""
         user = user.split('!', 1)[0]
-        self.logger.log("* %s %s" % (user, msg))
-
-    # irc callbacks
 
     def irc_NICK(self, prefix, params):
-        """Called when an IRC user changes their nickname."""
         old_nick = prefix.split('!')[0]
         new_nick = params[0]
-        self.logger.log("%s is now known as %s" % (old_nick, new_nick))
 
-
-    # For fun, override the method that determines how a nickname is changed on
-    # collisions. The default method appends an underscore.
     def alterCollidedNick(self, nickname):
-        """
-        Generate an altered version of a nickname that caused a collision in an
-        effort to create an unused related name for subsequent registration.
-        """
         return nickname + '^'
 
-
-
 class LogBotFactory(protocol.ClientFactory):
-    """A factory for LogBots.
+    def __init__(self, settings):
+        self.settings = settings;
 
-    A new protocol instance will be created each time we connect to the server.
-    """
+    def event_exchange(self):
+        self.exchange_connection = pika.BlockingConnection(pika.ConnectionParameters(host='localhost'))
+        self.exchange = self.exchange_connection.channel()
+        self.exchange.exchange_declare(exchange='klacz.events', type='fanout')
 
-    def __init__(self, channel, filename):
-        self.channel = channel
-        self.filename = filename
+    def responses_queue(self):
+        self.responses_connection = pika.BlockingConnection(pika.ConnectionParameters('localhost'))
+        self.responses_channel = self.responses_connection.channel()
+        self.responses_channel.queue_declare(queue='klacz.responses')
 
     def buildProtocol(self, addr):
+        self.event_exchange()
+        self.responses_queue()
+
         p = LogBot()
+        p.nickname = self.settings["nickname"].encode('ascii')
+        self.responses_channel.basic_consume(p.module_message, queue='klacz.responses', no_ack=True)
+        self.thr = Thread(target=lambda : self.responses_channel.start_consuming())
+        self.thr.start()
+        print "ELO"
         p.factory = self
+
         return p
 
     def clientConnectionLost(self, connector, reason):
-        """If we get disconnected, reconnect to server."""
         connector.connect()
 
     def clientConnectionFailed(self, connector, reason):
         print "connection failed:", reason
         reactor.stop()
 
+    def __del__(self):
+        channel.close()
 
 if __name__ == '__main__':
-    # initialize logging
-    log.startLogging(sys.stdout)
-    # create factory protocol and application
-    f = LogBotFactory(sys.argv[1], sys.argv[2])
+    def die():
+        print "bye"
 
-    # connect factory to this host and port
-    reactor.connectTCP("irc.freenode.net", 6667, f)
+    settings = Settings();
+    res = settings.getConfig()['payload'];
+    factory = LogBotFactory(res)
+    reactor.connectTCP(res["server"], 6667, factory)
 
-    # run bot
+    print "starting reactor"
+    atexit.register(die)
     reactor.run()
